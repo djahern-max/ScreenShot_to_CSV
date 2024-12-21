@@ -1,8 +1,20 @@
+"""
+Expense Screenshot Processor
+A PyQt6 application for capturing and processing expense data from screenshots.
+"""
+
 import sys
 import json
 import os
 import platform
-import subprocess
+from datetime import datetime
+import time
+import re
+import io
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any
+from decimal import Decimal, InvalidOperation as DecimalException
+
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -16,7 +28,6 @@ from PyQt6.QtWidgets import (
     QLabel,
     QFileDialog,
     QMessageBox,
-    QInputDialog,
     QDialog,
     QLineEdit,
 )
@@ -24,100 +35,172 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 from PIL import Image
 import pytesseract
-from datetime import datetime
-import time
-import re
-import io
+import subprocess
+
+
+# Data Models
+@dataclass
+class Expense:
+    amount: Decimal
+    remark: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"amount": float(self.amount), "remark": self.remark}
+
+
+class OCRProcessor:
+    """Handles OCR processing and text extraction"""
+
+    def __init__(self):
+        self._setup_tesseract()
+
+    def _setup_tesseract(self):
+        """Configure Tesseract based on operating system"""
+        if platform.system().lower() == "darwin":
+            pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
+        else:
+            pytesseract.pytesseract.tesseract_cmd = (
+                r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+            )
+
+    def process_image(self, image: Image.Image) -> List[Expense]:
+        """Process image and extract expenses"""
+        text = pytesseract.image_to_string(image, config="--psm 6")
+        return self._parse_text(text)
+
+    def _parse_text(self, text: str) -> List[Expense]:
+        """Parse OCR text into expense objects"""
+        expenses = []
+        amount_pattern = r"^(\d+\.?\d*)"
+
+        for line in text.split("\n"):
+            if not line.strip():
+                continue
+
+            parts = line.split()
+            amount_match = re.match(amount_pattern, parts[0])
+
+            if amount_match:
+                try:
+                    amount = Decimal(amount_match.group().replace(",", ""))
+                    remark = (
+                        parts[-1]
+                        if parts[-1].isdigit() and len(parts[-1]) <= 6
+                        else "No Remark Available"
+                    )
+                    expenses.append(
+                        Expense(amount=amount.quantize(Decimal("0.01")), remark=remark)
+                    )
+                except (ValueError, DecimalException):
+                    continue
+
+        return expenses
 
 
 class TotalInputDialog(QDialog):
+    """Dialog for entering expected total amount"""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Enter Expected Total")
-        self.setup_ui()
+        self._setup_ui()
 
-    def setup_ui(self):
+    def _setup_ui(self):
         layout = QVBoxLayout(self)
 
-        instruction = QLabel("Please enter the expected total amount:")
-        layout.addWidget(instruction)
+        # Add instruction label
+        layout.addWidget(QLabel("Please enter the expected total amount:"))
 
+        # Add input field
         self.total_input = QLineEdit()
         self.total_input.setPlaceholderText("Enter amount (e.g., 1234.56)")
         layout.addWidget(self.total_input)
 
-        buttons = QHBoxLayout()
+        # Add buttons
+        button_layout = QHBoxLayout()
         ok_button = QPushButton("OK")
         ok_button.clicked.connect(self.accept)
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
 
-        buttons.addWidget(ok_button)
-        buttons.addWidget(cancel_button)
-        layout.addLayout(buttons)
+        button_layout.addWidget(ok_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
 
-    def get_total(self):
+    def get_total(self) -> Optional[Decimal]:
+        """Get the entered total amount"""
         try:
-            return float(self.total_input.text())
-        except ValueError:
+            return Decimal(self.total_input.text())
+        except (ValueError, DecimalException):
             return None
 
 
 class ErrorCorrectionDialog(QDialog):
-    def __init__(self, expenses, expected_total=None, parent=None):
+    """Dialog for reviewing and correcting expense entries"""
+
+    def __init__(
+        self, expenses: List[Expense], expected_total: Optional[Decimal], parent=None
+    ):
         super().__init__(parent)
         self.expenses = expenses.copy()
         self.expected_total = expected_total
         self.setWindowTitle("Error Correction")
         self.setModal(True)
-        self.setup_ui()
-        self.filter_suspicious_entries()
-        self.update_totals()
+        self._setup_ui()
+        self._filter_suspicious_entries()
+        self._update_totals()
 
-    def is_suspicious(self, expense):
-        """Check if an expense entry might need review"""
-        amount = expense["amount"]
-
-        if amount == int(amount):
-            return True
-        if amount % 1 in [0.99, 0.95]:
-            return False
-        if amount < 10:
-            return True
-
+    def _is_suspicious(self, expense: Expense) -> bool:
+        """Determine if an expense entry needs review"""
+        amount = float(expense.amount)
         cents = int((amount % 1) * 100)
-        if cents not in [0, 50, 95, 99] and cents < 90:
-            return True
 
-        return False
+        return any(
+            [
+                amount == int(amount),
+                amount < 10,
+                cents not in [0, 50, 95, 99] and cents < 90,
+            ]
+        )
 
-    def filter_suspicious_entries(self):
-        """Hide rows that don't need review"""
-        for row in range(self.table.rowCount()):
-            amount = float(self.table.item(row, 1).text())
-            expense = {"amount": amount, "remark": self.table.item(row, 2).text()}
-
-            if not self.is_suspicious(expense):
-                self.table.hideRow(row)
-
-    def setup_ui(self):
+    def _setup_ui(self):
+        """Set up the dialog's user interface"""
         layout = QVBoxLayout(self)
 
+        # Add totals display
+        self._setup_totals_display(layout)
+
+        # Add instructions
+        self._setup_instructions(layout)
+
+        # Add expense table
+        self._setup_expense_table(layout)
+
+        # Add buttons
+        self._setup_buttons(layout)
+
+    def _setup_totals_display(self, layout: QVBoxLayout):
         totals_layout = QHBoxLayout()
+
         self.expected_total_label = QLabel(
-            f"Expected Total: ${self.expected_total:.2f}"
+            f"Expected Total: ${float(self.expected_total):.2f}"
             if self.expected_total
             else "Expected Total: Not Set"
         )
         self.current_total_label = QLabel("Current Total: $0.00")
         self.difference_label = QLabel("Difference: $0.00")
 
-        totals_layout.addWidget(self.expected_total_label)
-        totals_layout.addWidget(self.current_total_label)
-        totals_layout.addWidget(self.difference_label)
+        for label in [
+            self.expected_total_label,
+            self.current_total_label,
+            self.difference_label,
+        ]:
+            totals_layout.addWidget(label)
+
         layout.addLayout(totals_layout)
 
-        instruction_label = QLabel(
+    def _setup_instructions(self, layout: QVBoxLayout):
+        instructions = QLabel(
             "Review highlighted entries that might need correction.\n"
             "Common issues:\n"
             "- Missing digits (e.g., $1.34 instead of $51.34)\n"
@@ -125,69 +208,85 @@ class ErrorCorrectionDialog(QDialog):
             "- OCR misreading numbers\n\n"
             "Non-suspicious entries are hidden automatically."
         )
-        instruction_label.setWordWrap(True)
-        layout.addWidget(instruction_label)
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
 
+    def _setup_expense_table(self, layout: QVBoxLayout):
         self.table = QTableWidget()
         self.table.setColumnCount(3)
         self.table.setHorizontalHeaderLabels(["Entry #", "Amount", "Remark"])
         self.table.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.ResizeMode.Stretch
         )
-        self.table.itemChanged.connect(self.update_totals)
+        self.table.itemChanged.connect(self._update_totals)
 
+        # Populate table
         self.table.setRowCount(len(self.expenses))
         for i, expense in enumerate(self.expenses):
+            # Entry number
             entry_item = QTableWidgetItem(str(i + 1))
             entry_item.setFlags(entry_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table.setItem(i, 0, entry_item)
 
-            amount_item = QTableWidgetItem(f"{expense['amount']:.2f}")
+            # Amount
+            amount_item = QTableWidgetItem(f"{float(expense.amount):.2f}")
             self.table.setItem(i, 1, amount_item)
 
-            remark_item = QTableWidgetItem(expense["remark"])
+            # Remark
+            remark_item = QTableWidgetItem(expense.remark)
             remark_item.setFlags(remark_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table.setItem(i, 2, remark_item)
 
         layout.addWidget(self.table)
 
+    def _setup_buttons(self, layout: QVBoxLayout):
         button_layout = QHBoxLayout()
 
         show_all_button = QPushButton("Show All Entries")
         show_all_button.clicked.connect(self.show_all_entries)
-        button_layout.addWidget(show_all_button)
 
         save_button = QPushButton("Save Corrections")
-        save_button.clicked.connect(self.check_total_match)
-        button_layout.addWidget(save_button)
+        save_button.clicked.connect(self._check_total_match)
 
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
-        button_layout.addWidget(cancel_button)
+
+        for button in [show_all_button, save_button, cancel_button]:
+            button_layout.addWidget(button)
 
         layout.addLayout(button_layout)
+
+    def _filter_suspicious_entries(self):
+        """Hide rows that don't need review"""
+        for row in range(self.table.rowCount()):
+            amount = Decimal(self.table.item(row, 1).text())
+            expense = Expense(amount=amount, remark=self.table.item(row, 2).text())
+
+            if not self._is_suspicious(expense):
+                self.table.hideRow(row)
 
     def show_all_entries(self):
         """Show all rows, including non-suspicious ones"""
         for row in range(self.table.rowCount()):
             self.table.showRow(row)
 
-    def update_totals(self):
+    def _update_totals(self):
         """Update the total and difference labels"""
         try:
-            current_total = sum(
-                float(self.table.item(row, 1).text())
-                for row in range(self.table.rowCount())
-                if self.table.item(row, 1) is not None
-            )
+            current_total = Decimal("0")
+            for row in range(self.table.rowCount()):
+                if self.table.item(row, 1) is not None:
+                    current_total += Decimal(self.table.item(row, 1).text())
 
-            self.current_total_label.setText(f"Current Total: ${current_total:.2f}")
+            self.current_total_label.setText(
+                f"Current Total: ${float(current_total):.2f}"
+            )
 
             if self.expected_total is not None:
                 difference = self.expected_total - current_total
-                self.difference_label.setText(f"Difference: ${difference:.2f}")
+                self.difference_label.setText(f"Difference: ${float(difference):.2f}")
 
-                if abs(difference) < 0.01:
+                if abs(difference) < Decimal("0.01"):
                     self.difference_label.setStyleSheet("color: green;")
                 else:
                     self.difference_label.setStyleSheet("color: red;")
@@ -196,20 +295,20 @@ class ErrorCorrectionDialog(QDialog):
             self.current_total_label.setText("Current Total: $0.00")
             self.difference_label.setText("Difference: N/A")
 
-    def check_total_match(self):
+    def _check_total_match(self):
         """Check if totals match before accepting"""
         if self.expected_total is not None:
-            current_total = sum(
-                float(self.table.item(row, 1).text())
-                for row in range(self.table.rowCount())
-            )
+            current_total = Decimal("0")
+            for row in range(self.table.rowCount()):
+                current_total += Decimal(self.table.item(row, 1).text())
+
             difference = abs(self.expected_total - current_total)
 
-            if difference > 0.01:
+            if difference > Decimal("0.01"):
                 reply = QMessageBox.question(
                     self,
                     "Totals Don't Match",
-                    f"There is still a difference of ${difference:.2f}. "
+                    f"There is still a difference of ${float(difference):.2f}. "
                     f"Do you want to continue reviewing?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
@@ -218,50 +317,50 @@ class ErrorCorrectionDialog(QDialog):
 
         self.accept()
 
-    def get_corrected_expenses(self):
+    def get_corrected_expenses(self) -> List[Expense]:
+        """Get the list of corrected expenses"""
         corrected_expenses = []
         for row in range(self.table.rowCount()):
             try:
-                amount = float(self.table.item(row, 1).text())
+                amount = Decimal(self.table.item(row, 1).text())
                 remark = self.table.item(row, 2).text()
                 corrected_expenses.append(
-                    {"amount": round(amount, 2), "remark": remark}
+                    Expense(amount=amount.quantize(Decimal("0.01")), remark=remark)
                 )
-            except (ValueError, AttributeError):
+            except (ValueError, DecimalException, AttributeError):
                 continue
         return corrected_expenses
 
 
-class FinancialScreenshotApp(QMainWindow):
+class ExpenseApp(QMainWindow):
+    """Main application window"""
+
     def __init__(self):
         super().__init__()
+        self.expenses: List[Expense] = []
+        self.total_processed = 0
+        self.expected_total: Optional[Decimal] = None
+        self.ocr_processor = OCRProcessor()
 
-        # Initialize Tesseract path
-        if platform.system().lower() == "darwin":  # Mac
-            pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
-        else:  # Windows - adjust path as needed
-            pytesseract.pytesseract.tesseract_cmd = (
-                r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-            )
+        self._setup_window()
+        self._create_ui()
 
-        # Initialize main window properties
+    def _setup_window(self):
+        """Configure main window properties"""
         self.setWindowTitle("Expense Screenshot to JSON Converter")
         self.setGeometry(100, 100, 500, 400)
 
-        # Initialize variables
-        self.expenses = []
-        self.total_processed = 0
-        self.expected_total = None
-
-        # Create and set up the UI
-        self.create_ui()
-
-    def create_ui(self):
+    def _create_ui(self):
+        """Create the main user interface"""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
 
-        # Instructions label
+        self._add_instructions(layout)
+        self._add_buttons(layout)
+        self._add_status_labels(layout)
+
+    def _add_instructions(self, layout: QVBoxLayout):
         instructions = QLabel(
             "Instructions:\n\n"
             "1. Click 'Set Expected Total' to enter the known total\n"
@@ -275,65 +374,55 @@ class FinancialScreenshotApp(QMainWindow):
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
 
-        # Add Set Total button
+    def _add_buttons(self, layout: QVBoxLayout):
+        # Set Total button
         self.set_total_btn = QPushButton("Set Expected Total")
-        self.set_total_btn.clicked.connect(self.set_expected_total)
+        self.set_total_btn.clicked.connect(self._set_expected_total)
         layout.addWidget(self.set_total_btn)
 
-        # Buttons
+        # Capture button
         self.capture_btn = QPushButton("Capture Region")
-        self.capture_btn.clicked.connect(self.capture_screenshot)
+        self.capture_btn.clicked.connect(self._capture_screenshot)
         layout.addWidget(self.capture_btn)
 
+        # Save button
         self.save_btn = QPushButton("Save to JSON")
-        self.save_btn.clicked.connect(self.save_json)
+        self.save_btn.clicked.connect(self._save_json)
         layout.addWidget(self.save_btn)
 
-        # Status labels
-        self.total_label = QLabel("Expected Total: Not Set")
-        layout.addWidget(self.total_label)
-
-        self.counter_label = QLabel("Processed expenses: 0")
-        layout.addWidget(self.counter_label)
-
-        self.status_label = QLabel("")
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
-
-        # Add Exit button
+        # Exit button
         self.exit_btn = QPushButton("Exit")
-        self.exit_btn.clicked.connect(self.confirm_exit)
+        self.exit_btn.clicked.connect(self._confirm_exit)
         self.exit_btn.setStyleSheet("background-color: #ff4444; color: white;")
         layout.addWidget(self.exit_btn)
 
-    def set_expected_total(self):
+    def _add_status_labels(self, layout: QVBoxLayout):
+        self.total_label = QLabel("Expected Total: Not Set")
+        self.counter_label = QLabel("Processed expenses: 0")
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+
+        for label in [self.total_label, self.counter_label, self.status_label]:
+            layout.addWidget(label)
+
+    def _set_expected_total(self):
+        """Set the expected total amount"""
         dialog = TotalInputDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.expected_total = dialog.get_total()
             if self.expected_total is not None:
-                self.total_label.setText(f"Expected Total: ${self.expected_total:.2f}")
+                self.total_label.setText(
+                    f"Expected Total: ${float(self.expected_total):.2f}"
+                )
             else:
                 QMessageBox.warning(
                     self, "Invalid Input", "Please enter a valid number."
                 )
 
-    def confirm_exit(self):
-        if self.expenses and len(self.expenses) > 0:
-            reply = QMessageBox.question(
-                self,
-                "Confirm Exit",
-                "You have unsaved expenses. Are you sure you want to exit?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                self.close()
-        else:
-            self.close()
-
-    def capture_screenshot(self):
+    def _capture_screenshot(self):
+        """Capture and process screenshot region"""
         try:
-            # Show the message box first, before minimizing
+            # Show instruction message
             QMessageBox.information(
                 self,
                 "Region Selection",
@@ -341,11 +430,12 @@ class FinancialScreenshotApp(QMainWindow):
                 "After clicking OK, select the region containing both Amount and Remark columns.",
             )
 
-            # Hide the main window and give time for UI to update
+            # Hide window and wait
             self.hide()
             QApplication.processEvents()
-            time.sleep(1)  # Increased delay to ensure window is hidden
+            time.sleep(1)
 
+            # Capture screenshot based on OS
             if platform.system().lower() == "darwin":  # Mac
                 result = subprocess.run(
                     ["screencapture", "-i", "-"], capture_output=True, check=True
@@ -357,8 +447,8 @@ class FinancialScreenshotApp(QMainWindow):
                 )
                 img = Image.open(io.BytesIO(result.stdout))
 
-            text = pytesseract.image_to_string(img, config="--psm 6")
-            new_expenses = self.process_text_to_json(text)
+            # Process the image
+            new_expenses = self.ocr_processor.process_image(img)
 
             if new_expenses:
                 dialog = ErrorCorrectionDialog(new_expenses, self.expected_total, self)
@@ -382,70 +472,26 @@ class FinancialScreenshotApp(QMainWindow):
                 self, "Error", f"Failed to capture/process region: {str(e)}"
             )
         finally:
-            # Always make sure the window is shown again
             self.show()
             QApplication.processEvents()
 
-    def process_text_to_json(self, text):
-        """Convert OCR text to structured JSON data with improved parsing"""
-        try:
-            # Split text into lines and filter empty lines
-            lines = [line.strip() for line in text.split("\n") if line.strip()]
-
-            new_expenses = []
-            # More strict pattern for positive numbers with optional decimals
-            amount_pattern = r"^(\d+\.?\d*)"
-
-            for line in lines:
-                # Split line into components
-                parts = line.split()
-                if not parts:
-                    continue
-
-                # Try to find amount
-                amount_match = re.match(amount_pattern, parts[0])
-                if amount_match:
-                    try:
-                        amount = float(amount_match.group().replace(",", ""))
-
-                        # Look for remark at the end of the line
-                        remark = "No Remark Available"
-
-                        # Check if there's a potential remark at the end
-                        last_part = parts[-1]
-                        if last_part.isdigit() and len(last_part) <= 6:
-                            remark = last_part
-
-                        new_expenses.append(
-                            {"amount": round(amount, 2), "remark": remark}
-                        )
-                    except ValueError:
-                        continue
-
-            return new_expenses
-
-        except Exception as e:
-            print(f"Error processing text: {str(e)}")
-            return []
-
-    def save_json(self):
+    def _save_json(self):
+        """Save processed expenses to JSON file"""
         if not self.expenses:
             QMessageBox.warning(self, "Warning", "No expense data to save.")
             return
 
-        total = sum(expense["amount"] for expense in self.expenses)
+        total = sum(expense.amount for expense in self.expenses)
 
+        # Check if totals match
         if self.expected_total is not None:
             difference = abs(self.expected_total - total)
-            if difference > 0.01:  # Allow for floating point imprecision
+            if difference > Decimal("0.01"):
                 reply = QMessageBox.question(
                     self,
                     "Totals Don't Match",
-                    f"Current total (${
-                        total:.2f}) differs from expected total "
-                    f"(${
-                        self.expected_total:.2f}) by ${
-                        difference:.2f}.\n\n"
+                    f"Current total (${float(total):.2f}) differs from expected total "
+                    f"(${float(self.expected_total):.2f}) by ${float(difference):.2f}.\n\n"
                     f"Do you want to save anyway?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No,
@@ -453,6 +499,7 @@ class FinancialScreenshotApp(QMainWindow):
                 if reply == QMessageBox.StandardButton.No:
                     return
 
+        # Get save location
         file_name, _ = QFileDialog.getSaveFileName(
             self,
             "Save JSON File",
@@ -464,10 +511,17 @@ class FinancialScreenshotApp(QMainWindow):
             return
 
         try:
-            final_json = {"expenses": sorted(self.expenses, key=lambda x: x["amount"])}
+            # Convert expenses to dictionary format
+            expenses_dict = {
+                "expenses": [
+                    expense.to_dict()
+                    for expense in sorted(self.expenses, key=lambda x: x.amount)
+                ]
+            }
 
+            # Save to file
             with open(file_name, "w") as f:
-                json.dump(final_json, f, indent=1)
+                json.dump(expenses_dict, f, indent=2)
 
             QMessageBox.information(
                 self,
@@ -477,71 +531,27 @@ class FinancialScreenshotApp(QMainWindow):
             )
 
         except Exception as e:
-            QMessageBox.critical(
+            QMessageBox.critical(self, "Error", f"Failed to save JSON: {str(e)}")
+
+    def _confirm_exit(self):
+        """Confirm before exiting if there are unsaved changes"""
+        if self.expenses:
+            reply = QMessageBox.question(
                 self,
-                "Error",
-                f"Failed to save JSON: {
-                    str(e)}",
+                "Confirm Exit",
+                "You have unsaved expenses. Are you sure you want to exit?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
             )
-
-
-def capture_screenshot(self):
-    try:
-        # Show the message box first, before minimizing
-        QMessageBox.information(
-            self,
-            "Region Selection",
-            "Click OK to start the screenshot capture process.\n\n"
-            "After clicking OK, select the region containing both Amount and Remark columns.",
-        )
-
-        # Hide the main window and give time for UI to update
-        self.hide()
-        QApplication.processEvents()
-        time.sleep(1)  # Increased delay to ensure window is hidden
-
-        if platform.system().lower() == "darwin":  # Mac
-            result = subprocess.run(
-                ["screencapture", "-i", "-"], capture_output=True, check=True
-            )
-            img = Image.open(io.BytesIO(result.stdout))
-        else:  # Windows
-            # Similar modification for Windows...
-            pass
-
-        text = pytesseract.image_to_string(img, config="--psm 6")
-        new_expenses = self.process_text_to_json(text)
-
-        if new_expenses:
-            dialog = ErrorCorrectionDialog(new_expenses, self.expected_total, self)
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                corrected_expenses = dialog.get_corrected_expenses()
-                self.expenses.extend(corrected_expenses)
-                self.total_processed += len(corrected_expenses)
-                self.counter_label.setText(
-                    f"Processed expenses: {self.total_processed}"
-                )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.close()
         else:
-            QMessageBox.warning(
-                self,
-                "Warning",
-                "No valid expense data found in selection.\n"
-                "Make sure Amount and Remark columns are clearly visible.",
-            )
-
-    except Exception as e:
-        QMessageBox.critical(
-            self, "Error", f"Failed to capture/process region: {str(e)}"
-        )
-    finally:
-        # Always make sure the window is shown again
-        self.show()
-        QApplication.processEvents()
+            self.close()
 
 
 def main():
     app = QApplication(sys.argv)
-    window = FinancialScreenshotApp()
+    window = ExpenseApp()  # Changed from FinancialScreenshotApp
     window.show()
     sys.exit(app.exec())
 
