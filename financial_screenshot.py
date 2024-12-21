@@ -36,6 +36,8 @@ from PyQt6.QtGui import QColor
 from PIL import Image
 import pytesseract
 import subprocess
+import tempfile
+from PIL import ImageGrab
 
 
 # Data Models
@@ -435,17 +437,25 @@ class ExpenseApp(QMainWindow):
             QApplication.processEvents()
             time.sleep(1)
 
-            # Capture screenshot based on OS
+            img = None
             if platform.system().lower() == "darwin":  # Mac
-                result = subprocess.run(
-                    ["screencapture", "-i", "-"], capture_output=True, check=True
-                )
-                img = Image.open(io.BytesIO(result.stdout))
+                # Create a temporary file for the screenshot
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+                try:
+                    result = subprocess.run(
+                        ["screencapture", "-i", temp_file.name], check=True
+                    )
+                    img = Image.open(temp_file.name)
+                finally:
+                    os.unlink(temp_file.name)  # Clean up the temporary file
             else:  # Windows
-                result = subprocess.run(
-                    ["snippingtool", "/clip"], capture_output=True, check=True
-                )
-                img = Image.open(io.BytesIO(result.stdout))
+                # Use ImageGrab for Windows
+                subprocess.run(["snippingtool", "/clip"], check=True)
+                time.sleep(0.5)  # Give some time for the clipboard to update
+                img = ImageGrab.grabclipboard()
+
+            if img is None:
+                raise Exception("Failed to capture screenshot")
 
             # Process the image
             new_expenses = self.ocr_processor.process_image(img)
@@ -468,9 +478,7 @@ class ExpenseApp(QMainWindow):
                 )
 
         except Exception as e:
-            QMessageBox.critical(
-                self, "Error", f"Failed to capture/process region: {str(e)}"
-            )
+            QMessageBox.critical(self, "Error", f"An error occurred: {str(e)}")
         finally:
             self.show()
             QApplication.processEvents()

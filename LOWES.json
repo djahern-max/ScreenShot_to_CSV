@@ -1,0 +1,68 @@
+{
+  "expenses": [
+    {
+      "amount": 4.4,
+      "remark": "6276"
+    },
+    {
+      "amount": 8.06,
+      "remark": "6276"
+    },
+    {
+      "amount": 9.21,
+      "remark": "0880"
+    },
+    {
+      "amount": 14.98,
+      "remark": "1508"
+    },
+    {
+      "amount": 18.46,
+      "remark": "7105"
+    },
+    {
+      "amount": 22.96,
+      "remark": "1884"
+    },
+    {
+      "amount": 43.34,
+      "remark": "7105"
+    },
+    {
+      "amount": 51.34,
+      "remark": "1884"
+    },
+    {
+      "amount": 56.52,
+      "remark": "1884"
+    },
+    {
+      "amount": 111.7,
+      "remark": "6448"
+    },
+    {
+      "amount": 113.19,
+      "remark": "6448"
+    },
+    {
+      "amount": 127.89,
+      "remark": "6283"
+    },
+    {
+      "amount": 165.54,
+      "remark": "6448"
+    },
+    {
+      "amount": 199.82,
+      "remark": "No Remark Available"
+    },
+    {
+      "amount": 211.64,
+      "remark": "1884"
+    },
+    {
+      "amount": 254.0,
+      "remark": "6246"
+    }
+  ]
+}
